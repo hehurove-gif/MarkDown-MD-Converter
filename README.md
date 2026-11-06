@@ -1,47 +1,78 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+# Markdown MD Converter
 
-:root {
-  font-family: 'Inter', 'Segoe UI', sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-  color: rgba(255, 255, 255, 0.9);
-  background: #020817;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
+Una aplicación web para convertir archivos de texto comunes a Markdown con un enfoque IA-friendly: más legible, más limpio y más fácil de consumir por modelos de lenguaje, herramientas de análisis y asistentes inteligentes.
 
-html {
-  scroll-behavior: smooth;
-}
+## Funcionalidades
+- TXT a Markdown
+- Word (.doc / .docx) a Markdown
+- PDF a Markdown
+- Imágenes con OCR (.png, .jpg, .jpeg) a Markdown
+- Limpieza inteligente de texto y eliminación de ruido
+- Markdown optimizado para lectura por IA
+- Vista previa del resultado
+- Copiar al portapapeles
+- Descargar como `.md`
+- Diseño responsivo con Tailwind CSS
+- Preparado para desplegar en Cloudflare Pages con Wrangler
 
-body {
-  margin: 0;
-  min-width: 320px;
-  min-height: 100vh;
-}
+## Stack
+- React + Vite
+- Tailwind CSS
+- `mammoth` para Word
+- `pdfjs-dist` para PDFs
+- `tesseract.js` para OCR
 
-* {
-  box-sizing: border-box;
-}
+## Instalación
 
-button,
-input,
-textarea {
-  font: inherit;
-}
+```bash
+npm install
+```
 
-textarea {
-  background: rgba(15, 23, 42, 0.7);
-}
+## Desarrollo
 
-textarea::placeholder {
-  color: #94a3b8;
-}
+```bash
+npm run dev
+```
 
-::selection {
-  background: rgba(34, 211, 238, 0.35);
-}
+## Build
+
+```bash
+npm run build
+```
+
+## Despliegue en Cloudflare Pages
+
+1. Instala Wrangler si aún no lo tienes:
+
+```bash
+npm install -D wrangler
+```
+
+2. Inicia sesión:
+
+```bash
+npx wrangler login
+```
+
+3. Compila la app:
+
+```bash
+npm run build
+```
+
+4. Despliega:
+
+```bash
+npx wrangler pages deploy dist --project-name markdown-md-converter
+```
+
+También puedes usar:
+
+```bash
+npm run deploy
+```
+
+## Notas
+- Para texto estructurado, la app intenta convertir párrafos, listas, títulos y bloques legibles en una versión más amigable para IA.
+- Para OCR en imágenes, la extracción depende del contenido visible y de la calidad del archivo.
+- El soporte para archivos `.doc` antiguos puede ser limitado según el navegador.
