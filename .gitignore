@@ -3,3 +3,6 @@ dist
 .vite
 .env
 .DS_Store
+
+# Estado local de wrangler dev
+.wrangler
