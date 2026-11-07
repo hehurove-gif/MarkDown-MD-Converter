@@ -8,6 +8,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mi
 
 const OCR_LANGS = 'spa+eng';
 const OCR_MAX_PAGES = 30;
+const OCR_LOAD_TIMEOUT_MS = 120000;
 const EMPTY_MESSAGE = 'No se encontró texto en el archivo.';
 
 export const supportedExtensions = ['.txt', '.docx', '.pdf', '.png', '.jpg', '.jpeg'];
@@ -21,12 +22,26 @@ function decodeText(buffer) {
   }
 }
 
-function createOcrWorker(onProgress, label = '') {
-  return Tesseract.createWorker(OCR_LANGS, 1, {
-    logger: (m) => {
-      if (m.status === 'recognizing text') onProgress?.(`${label}Reconociendo texto (OCR): ${Math.round(m.progress * 100)}%`);
-    },
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
   });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// El motor de OCR y el idioma se descargan la primera vez (~20 MB). Si no cargan, se avisa en vez de quedarse esperando.
+function createOcrWorker(onProgress, label = '') {
+  onProgress?.('Cargando el motor de OCR (la primera vez puede tardar)…');
+  return withTimeout(
+    Tesseract.createWorker(OCR_LANGS, 1, {
+      logger: (m) => {
+        if (m.status === 'recognizing text') onProgress?.(`${label}Reconociendo texto (OCR): ${Math.round(m.progress * 100)}%`);
+      },
+    }),
+    OCR_LOAD_TIMEOUT_MS,
+    'No se pudo cargar el motor de OCR. Necesita conexión a internet la primera vez; revisa tu conexión e inténtalo de nuevo.',
+  );
 }
 
 async function readTxt(file) {
