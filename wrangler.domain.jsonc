@@ -1,0 +1,17 @@
+{
+  // Configuración para cuando hetor.dev ya esté en tu cuenta de Cloudflare.
+  // Build command:  VITE_BASE_PATH=/tools/markdown/ npm run build
+  // Deploy command: npx wrangler deploy -c wrangler.domain.jsonc
+  "name": "markdown-md-converter",
+  "compatibility_date": "2026-11-06",
+  "assets": {
+    "directory": "./dist",
+    // Los archivos quedan en la raíz de dist; Cloudflare los sirve bajo /tools/markdown
+    "base_path": "/tools/markdown"
+  },
+  // Ruta con prioridad sobre el Custom Domain de hetor.dev (que atiende el Worker "hetor").
+  "routes": [{ "pattern": "hetor.dev/tools/markdown*", "zone_name": "hetor.dev" }],
+  "observability": {
+    "logs": { "enabled": true, "invocation_logs": true, "persist": true }
+  }
+}
