@@ -1,7 +1,8 @@
 /* Lógica de conversión a Markdown. Son funciones puras (sin React ni librerías del navegador)
    para poder probarlas con documentos reales desde Node. Los lectores de archivos viven en readers.js. */
 
-const BULLET = /^(?:[-*•·▪◦–•])\s+/;
+// Guiones y asteriscos exigen espacio; los símbolos (•, ➢, ✓, ❖, Wingdings...) pueden ir pegados al texto.
+const BULLET = /^(?:[-*–]\s+|[•·▪◦‣⁃■□●○◆◇▶►➢➤➔✓✔☑❖◼◾\uF000-\uF0FF]\s*)/;
 const NUMBERED = /^(\d{1,3})[.)]\s+/;
 const SENTENCE_END = /[.!?…;,]$/;
 const NUMBERED_HEADING = /^(\d+(?:\.\d+)*)\.?\s+[A-ZÁÉÍÓÚÑÜ¿¡]/;
@@ -378,7 +379,383 @@ function dropRepeatedHeadersAndFooters(pages) {
   });
 }
 
-export function pdfPagesToMarkdown(pagesItems) {
+/* Subíndices y superíndices: pdf.js los entrega como textos aparte, más pequeños y desplazados.
+   Se pegan a la letra anterior como caracteres Unicode (H₂O, Cr³⁺) para que no se lean como "H2O". */
+const SUB_CHARS = { 0: '₀', 1: '₁', 2: '₂', 3: '₃', 4: '₄', 5: '₅', 6: '₆', 7: '₇', 8: '₈', 9: '₉', '+': '₊', '-': '₋', '−': '₋', '–': '₋', '(': '₍', ')': '₎' };
+const SUP_CHARS = { 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '–': '⁻', '(': '⁽', ')': '⁾' };
+const SCRIPT_TEXT = /^[0-9+\-−–]+$/;
+
+export function mergeScripts(items) {
+  const out = items.map((item) => ({ ...item }));
+  const byX = [...out].sort((a, b) => a.x - b.x);
+  const dead = new Set();
+
+  for (const item of byX) {
+    const s = item.str.trim();
+    if (!s || !SCRIPT_TEXT.test(s)) continue;
+
+    let base = null;
+    let kind = null;
+    let best = Infinity;
+    for (const cand of byX) {
+      if (cand === item || dead.has(cand) || !cand.str.trim() || cand.h < item.h * 1.2) continue;
+      const gap = item.x - (cand.x + cand.w);
+      if (Math.abs(gap) > cand.h * 0.3) continue;
+      const dy = (item.y - cand.y) / cand.h;
+      const isSub = dy <= -0.08 && dy >= -0.6;
+      const isSup = dy >= 0.2 && dy <= 0.9;
+      if ((isSub || isSup) && Math.abs(gap) < best) {
+        best = Math.abs(gap);
+        base = cand;
+        kind = isSub ? SUB_CHARS : SUP_CHARS;
+      }
+    }
+    if (!base) continue;
+
+    base.str += [...s].map((c) => kind[c] || c).join('');
+    base.w = Math.max(base.w, item.x + item.w - base.x);
+    dead.add(item);
+  }
+  return out.filter((item) => !dead.has(item));
+}
+
+/* ---------- PDF de diapositivas ---------- */
+
+// Un PDF "de diapositivas" tiene páginas apaisadas (como una presentación exportada).
+export function isSlideDeck(pages) {
+  const sized = pages.filter((p) => p.width && p.height);
+  if (!sized.length) return false;
+  return sized.filter((p) => p.width >= p.height * 1.2).length / sized.length >= 0.6;
+}
+
+// Junta los textos en renglones y parte cada renglón donde hay un hueco grande (otra columna u otra molécula).
+function toSegments(items) {
+  const sorted = items.filter((i) => i.str.trim()).sort((a, b) => b.y - a.y);
+  const clusters = [];
+  for (const item of sorted) {
+    const current = clusters[clusters.length - 1];
+    if (current && Math.abs(current.y - item.y) <= Math.max(2, Math.min(current.h, item.h) * 0.45)) current.items.push(item);
+    else clusters.push({ y: item.y, h: item.h, items: [item] });
+  }
+
+  const segments = [];
+  clusters.forEach((cluster) => {
+    let seg = null;
+    let prevEnd = 0;
+    let prevH = 0;
+    cluster.items
+      .sort((a, b) => a.x - b.x)
+      .forEach((item) => {
+        const gap = item.x - prevEnd;
+        if (!seg || gap > Math.min(prevH, item.h) * 1.6) {
+          seg = { text: '', x0: item.x, x1: item.x, y: item.y, h: item.h };
+          segments.push(seg);
+        } else if (gap > item.h * 0.18 && !/\s$/.test(seg.text) && !/^\s/.test(item.str)) {
+          seg.text += ' ';
+        }
+        seg.text += item.str;
+        seg.x1 = item.x + item.w;
+        if (item.h > seg.h) {
+          seg.h = item.h;
+          seg.y = item.y;
+        }
+        prevEnd = item.x + item.w;
+        prevH = item.h;
+      });
+  });
+  segments.forEach((s) => {
+    s.text = s.text.replace(/\s+/g, ' ').trim();
+  });
+  return segments.filter((s) => s.text);
+}
+
+const segLine = (s) => ({ text: s.text, y: s.y, h: s.h, x: s.x0, x1: s.x1 });
+
+// Corta en franjas horizontales cuando entre dos grupos de texto hay un espacio en blanco.
+function splitBands(segs) {
+  const top = (s) => s.y + 0.8 * s.h;
+  const low = (s) => s.y - 0.2 * s.h;
+  const bands = [];
+  let bottom = Infinity;
+  [...segs].sort((a, b) => top(b) - top(a)).forEach((s) => {
+    if (bands.length && top(s) > bottom) {
+      bands[bands.length - 1].push(s);
+      bottom = Math.min(bottom, low(s));
+    } else {
+      bands.push([s]);
+      bottom = low(s);
+    }
+  });
+  return bands;
+}
+
+// Corta en columnas cuando hay un hueco vertical de al menos minGap.
+function splitCols(segs, minGap) {
+  const cols = [];
+  let right = -Infinity;
+  [...segs].sort((a, b) => a.x0 - b.x0).forEach((s) => {
+    if (cols.length && s.x0 - right <= minGap) {
+      cols[cols.length - 1].push(s);
+      right = Math.max(right, s.x1);
+    } else {
+      cols.push([s]);
+      right = s.x1;
+    }
+  });
+  return cols;
+}
+
+// Texto de una fila de fórmulas: lo que hay sobre/bajo cada flecha (reactivos) va entre corchetes.
+function rowText(row) {
+  return row.mains
+    .map((main, i) => {
+      if (i === 0) return main.text;
+      const labels = [...row.gaps[i - 1]].sort((a, b) => b.y - a.y).map((l) => l.text);
+      return `${labels.length ? ` —[${labels.join(', ')}]→ ` : ' | '}${main.text}`;
+    })
+    .join('');
+}
+
+// Varias columnas de una sola línea = una fila de fórmulas. El texto pequeño entre dos fórmulas
+// (KMnO₄, [O], - H₂O) es lo que está sobre la flecha de la reacción.
+function columnsAsRow(cols) {
+  const heights = cols.map((c) => Math.max(...c.map((s) => s.h)));
+  const ref = Math.max(...heights);
+  const isLabel = cols.map((c, i) => i > 0 && i < cols.length - 1 && heights[i] <= ref * 0.78 && c.length <= 3);
+  if (cols.filter((c, i) => !isLabel[i]).some((c) => c.length !== 1) || isLabel.filter((v) => !v).length < 2) return null;
+
+  const mains = [];
+  const gaps = [];
+  let labels = [];
+  let first = null;
+  cols.forEach((col, i) => {
+    if (isLabel[i]) {
+      labels.push(...col.map((s) => ({ text: s.text, y: s.y })));
+      return;
+    }
+    if (mains.length) gaps.push(labels);
+    else first = col[0];
+    labels = [];
+    mains.push({ text: col[0].text, x0: col[0].x0, x1: col[0].x1 });
+  });
+
+  // Sin reactivos solo es una fila si son textos cortos (nombres, fórmulas); si no, son columnas de texto.
+  const limit = gaps.some((g) => g.length) ? 45 : 30;
+  if (mains.some((m) => m.text.length > limit)) return null;
+
+  const row = { composite: true, mains, gaps, y: first.y, h: ref, x: first.x0 };
+  row.text = rowText(row);
+  return row;
+}
+
+// Un reactivo suelto (p. ej. "- H₂O" bajo la flecha) que quedó en su propia franja se devuelve a su flecha.
+function attachOrphanLabels(lines) {
+  const used = new Set();
+  lines.forEach((row, i) => {
+    if (!row.composite) return;
+    [i - 2, i - 1, i + 1, i + 2].forEach((j) => {
+      const cand = lines[j];
+      if (!cand || cand.composite || used.has(cand) || cand.x1 === undefined) return;
+      if (cand.h > row.h * 0.78 || Math.abs(cand.y - row.y) > row.h * 2.2) return;
+      const mid = (cand.x + cand.x1) / 2;
+      const gap = row.mains.findIndex((m, k) => k < row.mains.length - 1 && mid >= m.x1 && mid <= row.mains[k + 1].x0);
+      if (gap < 0) return;
+      row.gaps[gap].push({ text: cand.text, y: cand.y });
+      used.add(cand);
+    });
+    row.text = rowText(row);
+  });
+  return lines.filter((l) => !used.has(l));
+}
+
+function clusterLines(segs) {
+  const sorted = [...segs].sort((a, b) => b.y - a.y);
+  const rows = [];
+  sorted.forEach((s) => {
+    const row = rows[rows.length - 1];
+    if (row && Math.abs(row.y - s.y) <= Math.max(2, Math.min(row.h, s.h) * 0.45)) row.segs.push(s);
+    else rows.push({ y: s.y, h: s.h, segs: [s] });
+  });
+  return rows.map((row) => {
+    const ordered = row.segs.sort((a, b) => a.x0 - b.x0);
+    return { text: ordered.map((s) => s.text).join(' '), y: row.y, h: Math.max(...ordered.map((s) => s.h)), x: ordered[0].x0 };
+  });
+}
+
+// Orden de lectura de una diapositiva: franjas de arriba hacia abajo, columnas de izquierda a derecha.
+function xyCut(segs, minGap) {
+  if (!segs.length) return [];
+  if (segs.length === 1) return [segLine(segs[0])];
+  const bands = splitBands(segs);
+  if (bands.length > 1) return bands.flatMap((band) => xyCut(band, minGap));
+  const cols = splitCols(segs, minGap);
+  if (cols.length > 1) {
+    const row = columnsAsRow(cols);
+    if (row) return [row];
+    return cols.flatMap((col) => {
+      const lines = xyCut(col, minGap);
+      if (lines.length) lines[0].colStart = true;
+      return lines;
+    });
+  }
+  return clusterLines(segs);
+}
+
+function modeHeight(lines) {
+  const weight = new Map();
+  lines.forEach((l) => {
+    const key = Math.round(l.h * 2) / 2;
+    weight.set(key, (weight.get(key) || 0) + l.text.length);
+  });
+  return [...weight.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 0;
+}
+
+function looksLikeTitle(text) {
+  const words = text.split(/\s+/);
+  if (text.length > 90 || words.length > 12) return false;
+  if ((text.match(/[A-Za-zÀ-ÿ]/g) || []).length < 4) return false;
+  if (/[,;.:→=]|\s\+\s/.test(text)) return false;
+  // Una frase en minúsculas es un párrafo, no un título.
+  return !(words.length >= 8 && words.filter((w) => /^[a-zà-ÿ]/.test(w)).length / words.length > 0.5);
+}
+
+function pickTitle(lines, pageHeight) {
+  const title = pickTitleLines(lines, pageHeight);
+  return title.length && looksLikeTitle(joinWrapped(title.map((l) => l.text))) ? title : [];
+}
+
+function pickTitleLines(lines, pageHeight) {
+  const plain = lines.filter((l) => !l.composite);
+  if (!plain.length) return [];
+  const bodyH = modeHeight(plain);
+  const upper = plain.filter((l) => l.y >= pageHeight * 0.5 && l.text.length <= 140 && !BULLET.test(l.text));
+  const maxH = upper.length ? Math.max(...upper.map((l) => l.h)) : 0;
+
+  if (maxH >= bodyH * 1.12) {
+    const first = upper.filter((l) => l.h >= maxH * 0.92).sort((a, b) => b.y - a.y)[0];
+    const title = [first];
+    for (let i = lines.indexOf(first) + 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      const last = title[title.length - 1];
+      if (line.composite || line.colStart || BULLET.test(line.text) || Math.abs(line.h - first.h) > first.h * 0.08 || last.y - line.y > first.h * 1.7) break;
+      title.push(line);
+    }
+    return title;
+  }
+
+  // Diapositiva de portada: poco texto, todo del mismo tamaño y grande.
+  const chars = plain.reduce((sum, l) => sum + l.text.length, 0);
+  if (plain.length === lines.length && plain.length <= 4 && chars <= 100 && plain.every((l) => l.h >= 20 && !BULLET.test(l.text))) return plain;
+  return [];
+}
+
+function joinWrapped(parts) {
+  let text = parts[0];
+  for (let k = 1; k < parts.length; k += 1) {
+    text = /[A-Za-zÀ-ÿ]-$/.test(text) && /^[a-zà-ÿ]/.test(parts[k]) ? text.slice(0, -1) + parts[k] : `${text} ${parts[k]}`;
+  }
+  return text;
+}
+
+function linesToBlocks(lines) {
+  const blocks = [];
+  let current = null;
+  let previous = null;
+
+  lines.forEach((line) => {
+    const bullet = BULLET.test(line.text);
+    const numbered = NUMBERED.test(line.text);
+    const continues =
+      current &&
+      previous &&
+      !bullet &&
+      !numbered &&
+      !line.composite &&
+      !previous.composite &&
+      !line.colStart &&
+      Math.abs(line.h - previous.h) <= previous.h * 0.15 &&
+      previous.y - line.y > 0 &&
+      previous.y - line.y <= previous.h * 2.05 &&
+      line.x >= previous.x - previous.h * 0.8 &&
+      line.x <= previous.x + previous.h * 2.8;
+
+    if (continues) {
+      // Renglón que sigue al anterior: se pega al párrafo o al punto de la lista.
+      if (current.type === 'items') current.parts[current.parts.length - 1] = joinWrapped([current.parts[current.parts.length - 1], line.text]);
+      else current.parts.push(line.text);
+    } else if (line.composite) {
+      if (current && current.type === 'row' && previous.composite) current.parts.push(line.text);
+      else {
+        current = { type: 'row', parts: [line.text] };
+        blocks.push(current);
+      }
+    } else if (bullet || numbered) {
+      const text = bullet ? `- ${line.text.replace(BULLET, '')}` : `${line.text.match(NUMBERED)[1]}. ${line.text.replace(NUMBERED, '')}`;
+      if (current && current.type === 'items') current.parts.push(text);
+      else {
+        current = { type: 'items', parts: [text] };
+        blocks.push(current);
+      }
+    } else {
+      current = { type: 'p', parts: [line.text] };
+      blocks.push(current);
+    }
+    previous = line;
+  });
+
+  return blocks.map((block) => (block.type === 'p' ? joinWrapped(block.parts) : block.parts.join('\n')));
+}
+
+function cleanOcr(text) {
+  return (text || '')
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter((l) => (l.match(/[A-Za-zÀ-ÿ0-9]/g) || []).length >= 2)
+    .join('\n');
+}
+
+function slideToMarkdown(page, number) {
+  const items = mergeScripts(page.items).filter((i) => i.str.trim());
+  const segments = toSegments(items);
+  const lines = segments.length
+    ? attachOrphanLabels(xyCut(segments, Math.max(8, modeHeight(segments.map((s) => ({ h: s.h, text: s.text }))) * 0.5)))
+    : [];
+
+  const titleLines = pickTitle(lines, page.height || 540);
+  const body = lines.filter((l) => !titleLines.includes(l));
+  const title = titleLines.length ? joinWrapped(titleLines.map((l) => l.text)) : '';
+
+  const out = [`## Diapositiva ${number}${title ? `: ${title}` : ''}`];
+
+  // Esquemas de estructuras químicas dibujados con texto: solo quedan etiquetas sueltas.
+  const lengths = body.map((l) => l.text.length).sort((a, b) => a - b);
+  if (body.length >= 8 && lengths[Math.floor(lengths.length / 2)] <= 14 && lengths[lengths.length - 1] <= 70) {
+    out.push('*[Esquema o estructura química: las líneas siguientes son solo etiquetas sueltas; el dibujo y sus enlaces no se pudieron leer.]*');
+  }
+  out.push(...linesToBlocks(body));
+
+  const ocr = cleanOcr(page.ocrText);
+  if (ocr) {
+    out.push(`*Texto leído de las imágenes de esta diapositiva (OCR, puede tener errores):*\n\n${ocr.split('\n').map((l) => `> ${l}`).join('\n')}`);
+  } else if (!lines.length) {
+    out.push(page.imageCount > 0 ? '*[Diapositiva formada solo por imágenes o diagramas; su contenido no se pudo leer como texto.]*' : '*[Diapositiva sin texto legible (solo gráficos).]*');
+  }
+  return out.join('\n\n');
+}
+
+function slidesToMarkdown(pages) {
+  return pages.map((page, i) => slideToMarkdown(page, i + 1)).join('\n\n').trim();
+}
+
+/* Acepta una lista de páginas, cada una con { items, width, height, imageCount, ocrText },
+   o directamente la lista de textos de cada página (documento sin medidas). */
+export function pdfPagesToMarkdown(input) {
+  const pages = input.map((p) => (Array.isArray(p) ? { items: p } : p));
+  if (isSlideDeck(pages)) return slidesToMarkdown(pages);
+  return documentToMarkdown(pages.map((p) => mergeScripts(p.items)));
+}
+
+function documentToMarkdown(pagesItems) {
   const pages = dropRepeatedHeadersAndFooters(pagesItems.map(buildLines).filter((p) => p.length));
   const all = pages.flat();
   if (!all.length) return '';

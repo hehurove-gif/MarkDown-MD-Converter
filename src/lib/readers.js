@@ -2,12 +2,14 @@
 import Tesseract from 'tesseract.js';
 import mammoth from 'mammoth';
 import * as pdfjsLib from 'pdfjs-dist';
-import { htmlToMarkdown, pdfPagesToMarkdown, plainTextToMarkdown, toPdfItems } from './convert.js';
+import { htmlToMarkdown, isSlideDeck, pdfPagesToMarkdown, plainTextToMarkdown, toPdfItems } from './convert.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
 const OCR_LANGS = 'spa+eng';
 const OCR_MAX_PAGES = 30;
+// Una página con menos texto que esto, pero con imágenes, se considera "solo imagen" y se lee con OCR.
+const OCR_MIN_CHARS = 40;
 const OCR_LOAD_TIMEOUT_MS = 120000;
 const EMPTY_MESSAGE = 'No se encontró texto en el archivo.';
 
@@ -70,6 +72,15 @@ async function readLegacyDoc() {
   throw new Error('Los archivos .doc antiguos no se pueden leer en el navegador. Ábrelo en Word y guárdalo como .docx.');
 }
 
+async function renderPage(page) {
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  return canvas;
+}
+
 async function ocrPdf(pdf, onProgress) {
   const total = Math.min(pdf.numPages, OCR_MAX_PAGES);
   const worker = await createOcrWorker(onProgress);
@@ -78,12 +89,7 @@ async function ocrPdf(pdf, onProgress) {
     for (let n = 1; n <= total; n += 1) {
       onProgress?.(`PDF escaneado: leyendo página ${n} de ${total}…`);
       const page = await pdf.getPage(n);
-      const viewport = page.getViewport({ scale: 2 });
-      const canvas = document.createElement('canvas');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-      const { data } = await worker.recognize(canvas);
+      const { data } = await worker.recognize(await renderPage(page));
       texts.push(data.text || '');
     }
   } finally {
@@ -91,6 +97,45 @@ async function ocrPdf(pdf, onProgress) {
   }
   const note = pdf.numPages > total ? `Solo se leyeron las primeras ${total} páginas (el PDF tiene ${pdf.numPages}).` : '';
   return { markdown: plainTextToMarkdown(texts.join('\n\n')), note };
+}
+
+async function countImages(page) {
+  const { OPS } = pdfjsLib;
+  const imageOps = new Set([OPS.paintImageXObject, OPS.paintInlineImageXObject, OPS.paintImageMaskXObject, OPS.paintJpegXObject].filter((op) => op !== undefined));
+  const list = await page.getOperatorList();
+  return list.fnArray.filter((fn) => imageOps.has(fn)).length;
+}
+
+// En muchas presentaciones hay diapositivas que son una sola imagen (texto incluido): sin OCR se perderían.
+async function ocrImageOnlyPages(pdf, pages, onProgress) {
+  const targets = pages.filter((p) => p.chars < OCR_MIN_CHARS && p.imageCount > 0).slice(0, OCR_MAX_PAGES);
+  if (!targets.length) return '';
+
+  let worker;
+  try {
+    worker = await createOcrWorker(onProgress);
+  } catch (error) {
+    console.error(error);
+    return `${targets.length} diapositivas son solo imagen y no se pudieron leer: ${error.message}`;
+  }
+
+  let done = 0;
+  try {
+    for (const target of targets) {
+      onProgress?.(`Diapositiva ${target.number} es solo imagen: leyéndola con OCR (${done + 1} de ${targets.length})…`);
+      try {
+        const page = await pdf.getPage(target.number);
+        const { data } = await worker.recognize(await renderPage(page));
+        target.ocrText = data.text || '';
+      } catch (error) {
+        console.error(error);
+      }
+      done += 1;
+    }
+  } finally {
+    await worker.terminate();
+  }
+  return `${done} diapositivas eran solo imagen y se leyeron con OCR (pueden tener errores).`;
 }
 
 async function readPdf(file, onProgress) {
@@ -101,9 +146,12 @@ async function readPdf(file, onProgress) {
 
   for (let n = 1; n <= pdf.numPages; n += 1) {
     const page = await pdf.getPage(n);
+    const { width, height } = page.getViewport({ scale: 1 });
     const items = toPdfItems(await page.getTextContent());
-    characters += items.reduce((sum, item) => sum + item.str.trim().length, 0);
-    pages.push(items);
+    const chars = items.reduce((sum, item) => sum + item.str.trim().length, 0);
+    characters += chars;
+    const imageCount = chars < OCR_MIN_CHARS ? await countImages(page) : 0;
+    pages.push({ number: n, items, chars, width, height, imageCount });
   }
 
   // Sin texto seleccionable: es un PDF escaneado, se lee con OCR.
@@ -113,9 +161,10 @@ async function readPdf(file, onProgress) {
     return scanned;
   }
 
+  const note = isSlideDeck(pages) ? await ocrImageOnlyPages(pdf, pages, onProgress) : '';
   const markdown = pdfPagesToMarkdown(pages);
   if (!markdown) throw new Error(EMPTY_MESSAGE);
-  return { markdown };
+  return { markdown, note };
 }
 
 async function readImage(file, onProgress) {
