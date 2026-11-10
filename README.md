@@ -68,9 +68,19 @@ Probar en local: `VITE_BASE_PATH=/tools/markdown/ npm run build`.
 
 ## Lectura con IA (opcional)
 
-Para PDFs e imágenes con esquemas, reacciones químicas o tablas dibujadas, activa **Lectura con IA** en el panel izquierdo:
+Para PDFs e imágenes con esquemas, reacciones químicas o tablas dibujadas, activa **Lectura con IA** en el panel izquierdo y elige un proveedor:
 
-- Pegas tu propia clave de API de Anthropic y eliges el modelo. La clave va directo del navegador a `api.anthropic.com`; no pasa por ningún servidor de este proyecto y solo se guarda en el navegador si marcas "Recordar".
-- Cada página se envía como imagen (JPEG, máx. 1568 px) y tiene costo en tu cuenta de Anthropic. Límite: 80 páginas por archivo.
-- Si una página falla, se usa la lectura local para esa página. Sin clave, todo sigue procesándose localmente.
+| Proveedor | Costo | Notas |
+| --- | --- | --- |
+| Google Gemini | Gratis (con límites) | Clave en aistudio.google.com/apikey. En el plan gratis Google puede usar lo enviado para mejorar sus productos. |
+| OpenRouter (`:free`) | Gratis | Nemotron 3.5 Super VL, Gemma 4 31B o selección automática. Límite diario bajo. |
+| Groq | Gratis | Llama 4 Scout (visión, en preview). |
+| Personalizado / local | Gratis si es local | Cualquier servidor compatible con OpenAI que acepte imágenes: Ollama, LM Studio, etc. Requiere permitir el origen de la web (CORS; en Ollama, `OLLAMA_ORIGINS`). |
+| Anthropic Claude | De pago | El más preciso con reacciones y esquemas. |
+
+- La clave va directo del navegador al proveedor; no pasa por ningún servidor de este proyecto y solo se guarda en el navegador si marcas "Recordar".
+- Cada página se envía como imagen (JPEG, máx. 1568 px). Límite: 80 páginas por archivo.
+- Si una página falla, se usa la lectura local para esa página. Si se acaba la cuota diaria a la mitad, se conserva lo ya leído.
+- Los modelos gratuitos son menos precisos que los de pago con esquemas complejos: revisa el resultado.
+- Los modelos gratuitos de OpenCode Zen solo funcionan dentro de OpenCode, no desde otras apps; por eso se ofrecen sus equivalentes en OpenRouter. Un servidor OpenCode con clave de pago sí se puede usar con "Personalizado".
 - Pruebas: `npm test`.

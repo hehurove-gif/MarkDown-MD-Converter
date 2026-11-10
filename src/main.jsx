@@ -1,8 +1,8 @@
 import React, { useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { detectReader, supportedExtensions } from './lib/readers.js';
-import { loadAiSettings, saveAiSettings } from './lib/aiSettings.js';
-import { VISION_MODELS } from './lib/vision.js';
+import { loadAiSettings, resolveAi, saveAiSettings } from './lib/aiSettings.js';
+import { PROVIDERS, defaultModel, getProvider } from './lib/providers.js';
 import './index.css';
 
 const acceptedExtensions = [...supportedExtensions, '.doc'];
@@ -25,8 +25,13 @@ function App() {
     saveAiSettings(next);
   };
 
+  const provider = getProvider(ai.provider);
+  const currentKey = ai.keys[provider.id] || '';
+  const currentModel = ai.models[provider.id] ?? defaultModel(provider.id);
+  const modelIsPreset = provider.models.some((m) => m.id === currentModel);
+  const setKey = (value) => updateAi({ keys: { ...ai.keys, [provider.id]: value.trim() } });
+  const setModel = (value) => updateAi({ models: { ...ai.models, [provider.id]: value } });
   const supportsAi = selectedFile ? aiExtensions.some((ext) => selectedFile.name.toLowerCase().endsWith(ext)) : false;
-  const aiActive = ai.enabled && ai.apiKey.trim().length > 0;
 
   const fileLabel = useMemo(() => {
     if (!selectedFile) return 'Sin archivo seleccionado';
@@ -52,20 +57,21 @@ function App() {
       return;
     }
 
-    if (ai.enabled && !ai.apiKey.trim()) {
-      setStatus('Pega tu clave de API para usar la lectura con IA, o desactívala.');
+    const resolved = supportsAi ? resolveAi(ai) : { ai: null };
+    if (resolved.problem) {
+      setStatus(resolved.problem);
       return;
     }
 
     const controller = new AbortController();
     abortRef.current = controller;
-    const useAi = aiActive && supportsAi;
+    const useAi = Boolean(resolved.ai);
     setIsProcessing(true);
     setStatus('Procesando documento...');
 
     try {
       const reader = detectReader(selectedFile.name);
-      const options = { signal: controller.signal, ai: useAi ? { apiKey: ai.apiKey.trim(), model: ai.model } : null };
+      const options = { signal: controller.signal, ai: resolved.ai };
       const result = await reader(selectedFile, (message) => setStatus(message), options);
       setUsedAi(useAi);
       setMarkdown(result.markdown);
@@ -204,7 +210,7 @@ function App() {
                 <span>
                   <span className="block text-sm font-semibold text-white">Lectura con IA (más precisa)</span>
                   <span className="block text-xs text-slate-400">
-                    Transcribe esquemas, reacciones y tablas de PDFs e imágenes. Cada página se envía a Anthropic con tu propia clave de API y tiene costo.
+                    Transcribe esquemas, reacciones y tablas de PDFs e imágenes. Cada página se envía al proveedor que elijas, con tu propia clave. Hay opciones gratuitas.
                   </span>
                 </span>
               </label>
@@ -212,31 +218,94 @@ function App() {
               {ai.enabled && (
                 <div className="mt-3 space-y-3 text-sm">
                   <label className="block">
-                    <span className="mb-1 block text-xs text-slate-400">Clave de API de Anthropic</span>
+                    <span className="mb-1 block text-xs text-slate-400">Proveedor</span>
+                    <select
+                      value={ai.provider}
+                      onChange={(event) => updateAi({ provider: event.target.value })}
+                      className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
+                    >
+                      <optgroup label="Gratis">
+                        {PROVIDERS.filter((p) => p.free).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="De pago">
+                        {PROVIDERS.filter((p) => !p.free).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </label>
+                  <p className="rounded-lg bg-slate-900/80 px-3 py-2 text-xs text-slate-400">
+                    {provider.note}
+                    {provider.keyUrl && (
+                      <>
+                        {' '}
+                        <a href={provider.keyUrl} target="_blank" rel="noreferrer" className="text-cyan-300 hover:underline">
+                          Conseguir clave
+                        </a>
+                      </>
+                    )}
+                  </p>
+
+                  {provider.editableUrl && (
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-slate-400">URL base (termina antes de /chat/completions)</span>
+                      <input
+                        type="text"
+                        spellCheck={false}
+                        value={ai.baseUrl}
+                        onChange={(event) => updateAi({ baseUrl: event.target.value })}
+                        className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
+                      />
+                    </label>
+                  )}
+
+                  <label className="block">
+                    <span className="mb-1 block text-xs text-slate-400">Clave de API {provider.optionalKey ? '(opcional)' : ''}</span>
                     <input
                       type="password"
                       autoComplete="off"
                       spellCheck={false}
-                      value={ai.apiKey}
-                      onChange={(event) => updateAi({ apiKey: event.target.value.trim() })}
-                      placeholder="sk-ant-..."
+                      value={currentKey}
+                      onChange={(event) => setKey(event.target.value)}
+                      placeholder={provider.keyHint}
                       className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
                     />
                   </label>
+
                   <label className="block">
                     <span className="mb-1 block text-xs text-slate-400">Modelo</span>
-                    <select
-                      value={ai.model}
-                      onChange={(event) => updateAi({ model: event.target.value })}
-                      className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
-                    >
-                      {VISION_MODELS.map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {model.label}
-                        </option>
-                      ))}
-                    </select>
+                    {provider.models.length > 0 && (
+                      <select
+                        value={modelIsPreset ? currentModel : '__other'}
+                        onChange={(event) => setModel(event.target.value === '__other' ? '' : event.target.value)}
+                        className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
+                      >
+                        {provider.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                        <option value="__other">Otro modelo (escribir el ID)…</option>
+                      </select>
+                    )}
+                    {(!modelIsPreset || provider.models.length === 0) && (
+                      <input
+                        type="text"
+                        spellCheck={false}
+                        value={currentModel}
+                        onChange={(event) => setModel(event.target.value)}
+                        placeholder={provider.id === 'custom' ? 'llama3.2-vision' : 'ID exacto del modelo'}
+                        className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
+                      />
+                    )}
                   </label>
+
                   <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
                     <input
                       type="checkbox"
@@ -244,10 +313,10 @@ function App() {
                       onChange={(event) => updateAi({ remember: event.target.checked })}
                       className="h-4 w-4 accent-cyan-400"
                     />
-                    Recordar la clave en este navegador (no uses esto en una computadora compartida)
+                    Recordar las claves en este navegador (no uses esto en una computadora compartida)
                   </label>
                   <p className="text-xs text-slate-500">
-                    La clave no se guarda en ningún servidor nuestro: va directo del navegador a Anthropic. Solo aplica a PDF, PNG y JPG.
+                    Las claves no pasan por ningún servidor de esta web: van directo del navegador al proveedor. Solo aplica a PDF, PNG y JPG.
                     {selectedFile && !supportsAi ? ' Este archivo se convertirá sin IA.' : ''}
                   </p>
                 </div>
@@ -298,7 +367,7 @@ function App() {
               <p className="mt-3 text-xs text-slate-400">
                 {markdown.length.toLocaleString('es-MX')} caracteres · aprox. {Math.ceil(markdown.length / 4).toLocaleString('es-MX')} tokens
                 {usedAi
-                  ? '· las páginas se enviaron a Anthropic para leerlas con IA.'
+                  ? '· las páginas se enviaron al proveedor de IA elegido para leerlas.'
                   : '· tu archivo se procesa en tu navegador y no se sube a ningún servidor.'}
               </p>
             )}

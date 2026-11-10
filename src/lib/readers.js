@@ -131,8 +131,7 @@ async function readPdfWithAi(pdf, pages, options, onProgress) {
       hint: p.items.map((i) => i.str).join(' '),
       getImage: async () => pageToJpeg(await pdf.getPage(p.number)),
     })),
-    apiKey: ai.apiKey,
-    model: ai.model,
+    ai,
     label,
     total: pdf.numPages,
     signal,
@@ -157,6 +156,7 @@ async function readPdfWithAi(pdf, pages, options, onProgress) {
   const notes = [`Leído con IA (${ai.model}): puede contener errores, revísalo antes de usarlo.`];
   if (failed) notes.push(`${failed} páginas fallaron y se leyeron con el método local.`);
   if (empty) notes.push(`${empty} páginas sin contenido informativo se omitieron.`);
+  if (results.stopped) notes.push(`Se detuvo antes de terminar: ${results.stopped}`);
   return { markdown, note: notes.join(' ') };
 }
 
@@ -233,7 +233,7 @@ async function readPdf(file, onProgress, options = {}) {
     pages.push({ number: n, items, chars, width, height, imageCount });
   }
 
-  if (options.ai?.apiKey) {
+  if (options.ai) {
     const result = await readPdfWithAi(pdf, pages, options, onProgress);
     if (!result.markdown) throw new Error(EMPTY_MESSAGE);
     return result;
@@ -253,12 +253,11 @@ async function readPdf(file, onProgress, options = {}) {
 }
 
 async function readImage(file, onProgress, options = {}) {
-  if (options.ai?.apiKey) {
+  if (options.ai) {
     onProgress?.('Leyendo la imagen con IA…');
     const [result] = await transcribePages({
       pages: [{ number: 1, hint: '', getImage: () => imageFileToJpeg(file) }],
-      apiKey: options.ai.apiKey,
-      model: options.ai.model,
+      ai: options.ai,
       label: '',
       total: 1,
       signal: options.signal,

@@ -1,29 +1,23 @@
-/* Lectura con IA (visión): manda cada página como imagen a la API de Anthropic y devuelve Markdown.
+/* Lectura con IA (visión): manda cada página como imagen a un proveedor de IA y devuelve Markdown.
    No toca el DOM: las imágenes llegan ya renderizadas (base64 JPEG), así que se puede probar en Node. */
+import { buildRequest, classifyHttpError, getProvider, parseResponse } from './providers.js';
 
-export const API_URL = 'https://api.anthropic.com/v1/messages';
-export const API_VERSION = '2023-06-01';
 export const NO_CONTENT = '[[SIN_CONTENIDO]]';
 export const MAX_VISION_PAGES = 80;
 export const VISION_MAX_SIDE = 1568;
-export const VISION_DEFAULT_MODEL = 'claude-sonnet-5-5';
-export const VISION_MODELS = [
-  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (recomendado)' },
-  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 (más barato, menos preciso)' },
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 (el más preciso, el más caro)' },
-];
 
 const MAX_HINT_CHARS = 3000;
-const MAX_OUTPUT_TOKENS = 4096;
 const MAX_ATTEMPTS = 4;
+const MAX_RATE_ATTEMPTS = 6;
 
 export class VisionError extends Error {
-  constructor(message, { status, fatal = false, cause } = {}) {
+  constructor(message, { status, fatal = false, kind, cause } = {}) {
     super(message);
     this.name = 'VisionError';
     this.status = status;
-    // Un error "fatal" va a repetirse en todas las páginas (clave mala, sin saldo...): se detiene todo.
+    // Un error "fatal" va a repetirse en todas las páginas (clave mala, límite diario...): se detiene todo.
     this.fatal = fatal;
+    this.kind = kind;
     if (cause) this.cause = cause;
   }
 }
@@ -52,7 +46,7 @@ Reglas:
 Formato de salida: solo el Markdown, sin introducción ni comentarios tuyos y sin envolverlo en \`\`\`markdown.`;
 }
 
-export function buildUserContent({ image, label, number, total, hint }) {
+export function buildUserText({ label, number, total, hint }) {
   const heading = label
     ? `${label} ${number} de ${total}. Empieza con el encabezado "## ${label} ${number}: <título de la página>" (si la página no tiene un título visible, usa solo "## ${label} ${number}").`
     : 'Esta es una imagen suelta. Si tiene un título visible, empieza con "## <título>".';
@@ -61,33 +55,18 @@ export function buildUserContent({ image, label, number, total, hint }) {
   const hintText = cleanHint
     ? `\n\nTexto extraído automáticamente de la página (puede estar desordenado o incompleto; úsalo solo para confirmar ortografía y símbolos):\n<texto_extraido>\n${cleanHint}\n</texto_extraido>`
     : '';
-
-  return [
-    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
-    { type: 'text', text: `${heading}${hintText}` },
-  ];
+  return `${heading}${hintText}`;
 }
 
-// Limpia la respuesta: devuelve null si la página no tiene contenido y quita la cerca ```markdown si la puso.
-export function cleanModelOutput(text, stopReason) {
-  let out = String(text || '').trim();
-  if (out === NO_CONTENT || out.replace(/\s+/g, '') === NO_CONTENT) return null;
+// Limpia la respuesta: devuelve null si la página no tiene contenido, quita razonamiento visible y la cerca ```markdown.
+export function cleanModelOutput(text, truncated) {
+  let out = String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  if (out.replace(/\s+/g, '') === NO_CONTENT) return null;
   const fenced = out.match(/^```(?:markdown|md)\s*\n([\s\S]*?)\n```$/);
   if (fenced) out = fenced[1].trim();
-  if (stopReason === 'max_tokens') out += '\n\n*[La respuesta de la IA se cortó por longitud; puede faltar el final de esta página.]*';
+  if (!out) return null;
+  if (truncated) out += '\n\n*[La respuesta de la IA se cortó por longitud; puede faltar el final de esta página.]*';
   return out;
-}
-
-function friendlyError(status, apiMessage, model) {
-  if (status === 401) return ['La clave de API no es válida. Revisa que esté completa y sin espacios.', true];
-  if (status === 403) return ['Tu clave de API no tiene permiso para usar este servicio o modelo.', true];
-  if (status === 404) return [`El modelo ${model} no está disponible con tu clave. Elige otro modelo.`, true];
-  if (status === 400 && /credit|balance|billing/i.test(apiMessage)) {
-    return ['Tu cuenta de Anthropic no tiene saldo. Agrega créditos en console.anthropic.com.', true];
-  }
-  if (status === 429) return ['La API pidió esperar por exceso de solicitudes.', false];
-  if (status >= 500) return ['El servicio de Anthropic está saturado o falló.', false];
-  return [`La API rechazó esta página (${status}): ${apiMessage || 'sin detalle'}`, false];
 }
 
 function defaultSleep(ms, signal) {
@@ -105,88 +84,94 @@ function defaultSleep(ms, signal) {
   });
 }
 
-const backoff = (attempt) => Math.min(20000, 1500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 400);
+const backoff = (attempt) => Math.min(30000, 1500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 400);
 
-async function callApi({ apiKey, model, system, content, signal, fetchImpl, sleep }) {
+async function callApi({ ai, provider, system, text, image, signal, fetchImpl, sleep }) {
+  const { url, headers, body } = buildRequest({ provider, apiKey: ai.apiKey, model: ai.model, baseUrl: ai.baseUrl }, { system, text, image });
   let lastError;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+
+  for (let attempt = 1; ; attempt += 1) {
     if (signal?.aborted) throw abortError();
+    const retry = async (wait, limit) => {
+      if (attempt >= limit) return false;
+      await sleep(wait, signal);
+      return true;
+    };
 
     let response;
     try {
-      response = await fetchImpl(API_URL, {
-        method: 'POST',
-        signal,
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': API_VERSION,
-          // Obligatorio para llamar a la API desde un navegador, con la clave del propio usuario.
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: MAX_OUTPUT_TOKENS,
-          temperature: 0,
-          system,
-          messages: [{ role: 'user', content }],
-        }),
-      });
+      response = await fetchImpl(url, { method: 'POST', signal, headers, body: JSON.stringify(body) });
     } catch (error) {
       if (signal?.aborted || error?.name === 'AbortError') throw abortError();
-      lastError = new VisionError('No se pudo conectar con la API de Anthropic. Revisa tu conexión a internet.', { cause: error });
-      if (attempt < MAX_ATTEMPTS) {
-        await sleep(backoff(attempt), signal);
-        continue;
-      }
+      lastError = new VisionError(
+        provider.editableUrl
+          ? 'No se pudo conectar con el servidor. Revisa la URL, que esté encendido y que permita el origen de esta web (CORS).'
+          : 'No se pudo conectar con el proveedor de IA. Revisa tu conexión a internet.',
+        { cause: error },
+      );
+      if (await retry(backoff(attempt), MAX_ATTEMPTS)) continue;
       throw lastError;
     }
 
     if (response.ok) {
-      const data = await response.json();
-      const text = (data.content || []).filter((block) => block.type === 'text').map((block) => block.text).join('\n');
-      if (!text.trim()) throw new VisionError('La IA devolvió una respuesta vacía para esta página.');
-      return { text, stopReason: data.stop_reason };
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new VisionError('La respuesta del proveedor no tiene un formato válido.');
+      }
+      let parsed;
+      try {
+        parsed = parseResponse(provider, data);
+      } catch (error) {
+        // Algunos proveedores devuelven errores transitorios dentro de una respuesta 200.
+        lastError = new VisionError(error.message);
+        if (/rate|limit|overload|capacity|try again/i.test(error.message) && (await retry(backoff(attempt), MAX_ATTEMPTS))) continue;
+        throw lastError;
+      }
+      if (!parsed.text.trim()) throw new VisionError('La IA devolvió una respuesta vacía para esta página.');
+      return parsed;
     }
 
-    let apiMessage = '';
+    let raw = '';
     try {
-      apiMessage = (await response.json())?.error?.message || '';
+      raw = await response.text();
     } catch {
-      // La respuesta de error no era JSON; se usa solo el código.
+      // Sin cuerpo: se usa solo el código.
     }
-    const [message, fatal] = friendlyError(response.status, apiMessage, model);
-    lastError = new VisionError(message, { status: response.status, fatal });
+    const info = classifyHttpError(response.status, raw, { provider, model: ai.model });
+    lastError = new VisionError(info.message, { status: response.status, fatal: info.fatal, kind: info.kind });
+    if (info.fatal) throw lastError;
 
-    const retryable = response.status === 429 || response.status >= 500;
-    if (retryable && attempt < MAX_ATTEMPTS) {
-      const wait = Number(response.headers?.get?.('retry-after'));
-      await sleep(wait > 0 ? Math.min(wait, 30) * 1000 : backoff(attempt), signal);
-      continue;
-    }
+    const headerWait = Number(response.headers?.get?.('retry-after'));
+    const hinted = info.retryAfter || (headerWait > 0 ? headerWait : 0);
+    const wait = hinted ? Math.min(hinted, 60) * 1000 + 300 : backoff(attempt);
+    if (info.kind === 'rate' ? await retry(wait, MAX_RATE_ATTEMPTS) : info.kind === 'server' ? await retry(wait, MAX_ATTEMPTS) : false) continue;
     throw lastError;
   }
-  throw lastError;
 }
 
 /* pages: [{ number, hint, getImage: async () => base64Jpeg }]
+   ai: { provider, apiKey, model, baseUrl }
    Devuelve, en el mismo orden, { number, markdown } (markdown es null si la página no tiene contenido)
    o { number, markdown: null, error } si esa página falló. Si el error se repetiría en todas
-   (clave inválida, sin saldo), lanza una VisionError. */
+   (clave inválida, modelo sin visión), lanza una VisionError. Si se agota la cuota a mitad de camino,
+   devuelve lo ya leído y marca las páginas restantes con error; el resultado trae la propiedad "stopped". */
 export async function transcribePages({
   pages,
-  apiKey,
-  model = VISION_DEFAULT_MODEL,
+  ai,
   label = 'Página',
   total,
-  concurrency = 3,
+  concurrency,
   onProgress,
   signal,
   fetchImpl = (...args) => globalThis.fetch(...args),
   sleep = defaultSleep,
 }) {
+  const provider = getProvider(ai.provider);
   const system = buildSystemPrompt();
   const results = new Array(pages.length);
+  const workers = Math.max(1, Math.min(concurrency ?? provider.concurrency ?? 2, pages.length));
   let next = 0;
   let done = 0;
   let fatal = null;
@@ -200,9 +185,9 @@ export async function transcribePages({
       const page = pages[index];
       try {
         const image = await page.getImage();
-        const content = buildUserContent({ image, label, number: page.number, total: total ?? pages.length, hint: page.hint });
-        const { text, stopReason } = await callApi({ apiKey, model, system, content, signal, fetchImpl, sleep });
-        results[index] = { number: page.number, markdown: cleanModelOutput(text, stopReason) };
+        const text = buildUserText({ label, number: page.number, total: total ?? pages.length, hint: page.hint });
+        const { text: out, truncated } = await callApi({ ai, provider, system, text, image, signal, fetchImpl, sleep });
+        results[index] = { number: page.number, markdown: cleanModelOutput(out, truncated) };
       } catch (error) {
         if (error?.name === 'AbortError') return;
         if (error?.fatal) {
@@ -216,8 +201,17 @@ export async function transcribePages({
     }
   };
 
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, pages.length)) }, worker));
+  await Promise.all(Array.from({ length: workers }, worker));
   if (signal?.aborted) throw abortError();
-  if (fatal) throw fatal;
+
+  if (fatal) {
+    const anyDone = results.some((r) => r);
+    // Con cuota agotada se conserva lo ya leído; con clave o modelo inválidos no hay nada que rescatar.
+    if (!anyDone || fatal.kind === 'auth' || fatal.kind === 'model') throw fatal;
+    pages.forEach((page, i) => {
+      if (!results[i]) results[i] = { number: page.number, markdown: null, error: fatal.message };
+    });
+    results.stopped = fatal.message;
+  }
   return results;
 }
