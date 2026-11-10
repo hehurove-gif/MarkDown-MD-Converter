@@ -66,6 +66,13 @@ Probar en local: `VITE_BASE_PATH=/tools/markdown/ npm run build`.
 - Tu archivo se procesa en tu navegador y no se sube a ningún servidor.
 - Los `.doc` antiguos no se pueden leer en el navegador: ábrelo en Word y guárdalo como `.docx`.
 
+## Qué detecta la conversión local
+
+- **TXT:** títulos (MAYÚSCULAS, numerados, subrayados `====`), listas con niveles (`-`, `1)`, `a)`), código con sangría, tablas alineadas con espacios o dibujadas con `+---+`, y respeta el Markdown que ya traiga.
+- **DOCX:** títulos, listas anidadas, tablas (con celdas unidas), negrita/cursiva/tachado, subíndices y superíndices (H₂O, x²), citas, código, enlaces y notas al pie.
+- **PDF de documento:** columnas en orden de lectura, tablas, listas con niveles, bloques de código (tipografía monoespaciada), títulos por tamaño/negrita/numeración, énfasis en línea, y quita encabezados, pies y números de página repetidos.
+- **PDF de diapositivas:** reconstruye títulos, viñetas, reacciones químicas y subíndices (ver abajo la lectura con IA para esquemas).
+
 ## Lectura con IA (opcional)
 
 Para PDFs e imágenes con esquemas, reacciones químicas o tablas dibujadas, activa **Lectura con IA** en el panel izquierdo y elige un proveedor:

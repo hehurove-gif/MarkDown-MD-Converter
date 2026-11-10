@@ -1,12 +1,8 @@
 /* Lógica de conversión a Markdown. Son funciones puras (sin React ni librerías del navegador)
    para poder probarlas con documentos reales desde Node. Los lectores de archivos viven en readers.js. */
 
-// Guiones y asteriscos exigen espacio; los símbolos (•, ➢, ✓, ❖, Wingdings...) pueden ir pegados al texto.
-const BULLET = /^(?:[-*–]\s+|[•·▪◦‣⁃■□●○◆◇▶►➢➤➔✓✔☑❖◼◾\uF000-\uF0FF]\s*)/;
-const NUMBERED = /^(\d{1,3})[.)]\s+/;
-const SENTENCE_END = /[.!?…;,]$/;
-const NUMBERED_HEADING = /^(\d+(?:\.\d+)*)\.?\s+[A-ZÁÉÍÓÚÑÜ¿¡]/;
-const PAGE_NUMBER = /^(?:p[aá]g(?:ina)?\.?|page)?\s*\d{1,4}(?:\s*(?:\/|de|of)\s*\d{1,4})?$/i;
+import { BULLET, NUMBERED, NUMBERED_HEADING, SENTENCE_END } from './patterns.js';
+import { documentToMarkdown } from './pdfdoc.js';
 
 /* ---------- Texto plano ---------- */
 
@@ -16,9 +12,9 @@ export function normalizeText(raw) {
     .replace(/[   ]/g, ' ')
     .replace(/[​-‍﻿­]/g, '')
     .replace(/\f/g, '\n\n')
-    .replace(/\t/g, '  ')
+    .replace(/\t/g, '    ')
     .split('\n')
-    .map((line) => line.replace(/(\S)[ ]{2,}/g, '$1 ').replace(/\s+$/, ''))
+    .map((line) => line.replace(/\s+$/, ''))
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
 }
@@ -70,8 +66,40 @@ function lineKind(line) {
   return 'text';
 }
 
+const squeeze = (text) => text.replace(/(\S) {2,}/g, '$1 ');
+const indentOf = (line) => line.match(/^ */)[0].length;
+const LETTER_ITEM = /^[a-z][.)]\s+\S/i;
+const escapeCell = (text) => text.replace(/\|/g, '\\|');
+
+function rowsToTable(rows) {
+  const width = Math.max(...rows.map((r) => r.length));
+  const pad = (row) => [...row, ...Array(width - row.length).fill('')].map(escapeCell);
+  const line = (row) => `| ${pad(row).join(' | ')} |`;
+  return [line(rows[0]), `| ${Array(width).fill('---').join(' | ')} |`, ...rows.slice(1).map(line)].join('\n');
+}
+
+// Columnas alineadas con espacios (o tabuladores): "Nombre   Edad   Ciudad".
+function alignedTable(lines) {
+  if (lines.length < 2 || lines.some((l) => indentOf(l) >= 4 || lineKind(l) !== 'text')) return null;
+  const rows = lines.map((l) => l.trim().split(/ {2,}/));
+  const n = rows[0].length;
+  if (n < 2 || n > 8 || rows.some((r) => r.length !== n)) return null;
+  const cells = rows.flat();
+  if (cells.reduce((sum, c) => sum + c.length, 0) / cells.length > 32) return null;
+  return rowsToTable(rows);
+}
+
 function convertBlock(lines, { isFirst, hasNext }) {
   const first = lines[0].trim();
+
+  // Bloque con sangría de 4 o más espacios (y sin viñetas): es código.
+  if (lines.every((l) => indentOf(l) >= 4 && !BULLET.test(l.trim()) && !NUMBERED.test(l.trim()))) {
+    const base = Math.min(...lines.map(indentOf));
+    return `\`\`\`\n${lines.map((l) => l.slice(base)).join('\n')}\n\`\`\``;
+  }
+
+  const table = alignedTable(lines);
+  if (table) return table;
 
   // Título suelto: una sola línea corta, sin punto final, con algo después.
   const firstKind = lineKind(first);
@@ -85,6 +113,7 @@ function convertBlock(lines, { isFirst, hasNext }) {
   let para = [];
   let items = [];
   let passthrough = [];
+  let levels = []; // sangrías de los niveles de la lista actual
 
   const flushPara = () => {
     if (para.length) out.push(joinParagraph(para));
@@ -93,6 +122,7 @@ function convertBlock(lines, { isFirst, hasNext }) {
   const flushItems = () => {
     if (items.length) out.push(items.join('\n'));
     items = [];
+    levels = [];
   };
   const flushPass = () => {
     if (passthrough.length) out.push(passthrough.join('\n'));
@@ -104,14 +134,26 @@ function convertBlock(lines, { isFirst, hasNext }) {
     flushPass();
   };
 
+  const levelFor = (indent) => {
+    while (levels.length && indent < levels[levels.length - 1] - 1) levels.pop();
+    if (!levels.length || indent > levels[levels.length - 1] + 1) levels.push(indent);
+    return levels.length - 1;
+  };
+
   lines.forEach((line, index) => {
-    const t = line.trim();
-    const kind = lineKind(line);
+    const t = squeeze(line.trim());
+    let kind = lineKind(line);
+    const indent = indentOf(line);
+    // "a) paso" con sangría, dentro de una lista: subnivel.
+    const letterItem = kind === 'text' && indent >= 2 && items.length > 0 && LETTER_ITEM.test(t);
+    if (letterItem) kind = 'bullet';
 
     if (kind === 'bullet' || kind === 'number') {
       flushPara();
       flushPass();
-      items.push(kind === 'bullet' ? `- ${t.replace(BULLET, '')}` : `${t.match(NUMBERED)[1]}. ${t.replace(NUMBERED, '')}`);
+      const depth = '   '.repeat(levelFor(indent));
+      if (letterItem) items.push(`${depth}- ${t.replace(/^[a-z][.)]\s+/i, '')}`);
+      else items.push(kind === 'bullet' ? `${depth}- ${t.replace(BULLET, '')}` : `${depth}${t.match(NUMBERED)[1]}. ${t.replace(NUMBERED, '')}`);
       return;
     }
 
@@ -150,6 +192,48 @@ function convertBlock(lines, { isFirst, hasNext }) {
   return out.join('\n\n');
 }
 
+// Tablas dibujadas con +---+ y | | se pasan a tabla Markdown; los subrayados ==== y ---- bajo una línea son títulos.
+function preprocessText(text) {
+  const lines = text.split('\n');
+  const out = [];
+  const isBorder = (l) => /^\s*\+[-=+]{3,}\+\s*$/.test(l);
+  const isRow = (l) => /^\s*\|.*\|\s*$/.test(l);
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+
+    if (isBorder(line)) {
+      let j = i;
+      const rows = [];
+      while (j < lines.length && (isBorder(lines[j]) || isRow(lines[j]))) {
+        if (isRow(lines[j])) rows.push(lines[j].trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim()));
+        j += 1;
+      }
+      if (rows.length) {
+        out.push('', rowsToTable(rows), '');
+        i = j - 1;
+        continue;
+      }
+    }
+
+    const next = lines[i + 1];
+    const before = out.length ? out[out.length - 1] : '';
+    const plainLine = line.trim() && lineKind(line) === 'text' && !before.trim() && line.trim().length <= 100;
+    if (plainLine && next !== undefined && /^={3,}\s*$/.test(next)) {
+      out.push(`# ${line.trim()}`);
+      i += 1;
+      continue;
+    }
+    if (plainLine && next !== undefined && /^-{3,}\s*$/.test(next)) {
+      out.push(`## ${line.trim()}`);
+      i += 1;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 export function plainTextToMarkdown(raw) {
   const text = normalizeText(raw || '').trim();
   if (!text) return '';
@@ -172,7 +256,7 @@ export function plainTextToMarkdown(raw) {
       blocks.push({ raw: part.text });
       continue;
     }
-    part.text
+    preprocessText(part.text)
       .split(/\n[ ]*\n/)
       .map((b) => b.replace(/^\n+|\n+$/g, ''))
       .filter((b) => b.trim())
@@ -198,6 +282,21 @@ function wrapMarks(inner, mark) {
   return `${lead}${mark}${inner.trim()}${mark}${trail}`;
 }
 
+const SUB_LETTERS = { a: 'ₐ', e: 'ₑ', h: 'ₕ', i: 'ᵢ', j: 'ⱼ', k: 'ₖ', l: 'ₗ', m: 'ₘ', n: 'ₙ', o: 'ₒ', p: 'ₚ', r: 'ᵣ', s: 'ₛ', t: 'ₜ', u: 'ᵤ', v: 'ᵥ', x: 'ₓ', '=': '₌' };
+const SUP_LETTERS = {
+  a: 'ᵃ', b: 'ᵇ', c: 'ᶜ', d: 'ᵈ', e: 'ᵉ', f: 'ᶠ', g: 'ᵍ', h: 'ʰ', i: 'ⁱ', j: 'ʲ', k: 'ᵏ', l: 'ˡ', m: 'ᵐ', n: 'ⁿ', o: 'ᵒ', p: 'ᵖ', r: 'ʳ', s: 'ˢ', t: 'ᵗ', u: 'ᵘ', v: 'ᵛ', w: 'ʷ', x: 'ˣ', y: 'ʸ', z: 'ᶻ', '=': '⁼',
+};
+
+// Sub/superíndice de Word: si todos sus caracteres existen en Unicode se escribe así (H₂O, x²); si no, con <sub>/<sup>.
+function scriptText(text, digits, letters, tag) {
+  const t = text.trim();
+  if (!t) return text;
+  if (/^\[\d+\]$/.test(t)) return t; // referencia de nota al pie: se deja como [1]
+  const chars = [...t];
+  if (chars.every((c) => digits[c] || letters[c])) return chars.map((c) => digits[c] || letters[c]).join('');
+  return `<${tag}>${t}</${tag}>`;
+}
+
 function inline(node) {
   if (node.nodeType === TEXT) return node.nodeValue.replace(/\s+/g, ' ');
   if (node.nodeType !== ELEMENT) return '';
@@ -210,6 +309,14 @@ function inline(node) {
     case 'em':
     case 'i':
       return wrapMarks(children(), '*');
+    case 's':
+    case 'del':
+    case 'strike':
+      return wrapMarks(children(), '~~');
+    case 'sub':
+      return scriptText(children(), SUB_CHARS, SUB_LETTERS, 'sub');
+    case 'sup':
+      return scriptText(children(), SUP_CHARS, SUP_LETTERS, 'sup');
     case 'code':
       return `\`${children().trim()}\``;
     case 'br':
@@ -219,7 +326,7 @@ function inline(node) {
     case 'a': {
       const text = children().trim();
       const href = node.getAttribute('href') || '';
-      if (!text) return '';
+      if (!text || text === '↑') return '';
       if (!href || href.startsWith('#')) return text;
       return text === href ? href : `[${text}](${href})`;
     }
@@ -250,10 +357,22 @@ function listToMarkdown(list, depth) {
   return lines.join('\n');
 }
 
+function cellText(cell) {
+  const parts = [];
+  walkBlocks(cell, parts);
+  return parts.join(' ').replace(/\s*\n\s*/g, ' ').replace(/\|/g, '\\|').replace(/\s{2,}/g, ' ').trim();
+}
+
 function tableToMarkdown(table) {
-  const rows = Array.from(table.querySelectorAll('tr')).map((tr) =>
-    Array.from(tr.children).map((cell) => inline(cell).replace(/\s*\n\s*/g, ' ').replace(/\|/g, '\\|').trim()),
-  );
+  const rows = Array.from(table.querySelectorAll('tr')).map((tr) => {
+    const cells = [];
+    Array.from(tr.children).forEach((cell) => {
+      cells.push(cellText(cell));
+      const span = Number(cell.getAttribute('colspan')) || 1;
+      for (let k = 1; k < Math.min(span, 30); k += 1) cells.push('');
+    });
+    return cells;
+  });
   const width = Math.max(0, ...rows.map((r) => r.length));
   if (!width || !rows.length) return '';
   const pad = (row) => [...row, ...Array(width - row.length).fill('')];
@@ -268,7 +387,18 @@ function isBoldTitle(paragraph, text) {
   return text.length <= 80 && !SENTENCE_END.test(text) && /[A-Za-zÀ-ÿ]/.test(text);
 }
 
-function walkBlocks(parent, out) {
+function preText(node) {
+  if (node.nodeType === TEXT) return node.nodeValue;
+  if (node.nodeType !== ELEMENT) return '';
+  if (node.tagName.toLowerCase() === 'br') return '\n';
+  return Array.from(node.childNodes).map(preText).join('');
+}
+
+const hasClass = (node, name) => (node.getAttribute('class') || '').split(/\s+/).includes(name);
+const isFootnoteList = (list) => Array.from(list.children).some((li) => /(?:foot|end)note/i.test(li.getAttribute('id') || ''));
+
+// ctx.shift: niveles que se bajan los encabezados cuando el documento tiene Título (el título es el único #).
+function walkBlocks(parent, out, ctx = { shift: 0 }) {
   Array.from(parent.childNodes).forEach((node) => {
     if (node.nodeType === TEXT) {
       const t = node.nodeValue.replace(/\s+/g, ' ').trim();
@@ -277,45 +407,77 @@ function walkBlocks(parent, out) {
     }
     if (node.nodeType !== ELEMENT) return;
     const tag = node.tagName.toLowerCase();
+    const previousIndex = out.length - 1;
 
     if (/^h[1-6]$/.test(tag)) {
       const text = inline(node).replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
-      if (text) out.push(`${'#'.repeat(Number(tag[1]))} ${text}`);
+      const level = hasClass(node, 'doc-title') ? 1 : Math.min(Number(tag[1]) + ctx.shift, 6);
+      if (text) out.push(`${'#'.repeat(level)} ${text}`);
     } else if (tag === 'p') {
       const text = inline(node).replace(/[ ]*\n[ ]*/g, '\n').trim();
       if (!text) return;
       const plain = text.replace(/\*\*/g, '');
-      out.push(isBoldTitle(node, plain) ? `## ${plain}` : text);
+      if (hasClass(node, 'doc-subtitle')) out.push(`*${plain}*`);
+      else out.push(isBoldTitle(node, plain) ? `${'#'.repeat(Math.min(2 + ctx.shift, 6))} ${plain}` : text);
     } else if (tag === 'ul' || tag === 'ol') {
-      out.push(listToMarkdown(node, 0));
+      if (tag === 'ol' && isFootnoteList(node)) {
+        const notes = Array.from(node.children)
+          .map((li, i) => `[${i + 1}] ${inline(li).replace(/\s+/g, ' ').trim()}`)
+          .join('\n\n');
+        out.push(`---\n\n${notes}`);
+      } else {
+        out.push(listToMarkdown(node, 0));
+      }
     } else if (tag === 'table') {
       const md = tableToMarkdown(node);
       if (md) out.push(md);
     } else if (tag === 'pre') {
-      out.push(`\`\`\`\n${node.textContent.replace(/\n+$/, '')}\n\`\`\``);
+      const code = preText(node).replace(/\n+$/, '');
+      // Varias líneas de código seguidas (un párrafo por línea en Word) forman un solo bloque.
+      if (ctx.lastPre === previousIndex && previousIndex >= 0) out[previousIndex] = out[previousIndex].replace(/\n```$/, `\n${code}\n\`\`\``);
+      else out.push(`\`\`\`\n${code}\n\`\`\``);
+      ctx.lastPre = out.length - 1;
     } else if (tag === 'blockquote') {
       const inner = [];
-      walkBlocks(node, inner);
-      out.push(inner.join('\n\n').split('\n').map((l) => `> ${l}`.trimEnd()).join('\n'));
+      walkBlocks(node, inner, ctx);
+      const quoted = inner.join('\n\n').split('\n').map((l) => `> ${l}`.trimEnd()).join('\n');
+      if (ctx.lastQuote === previousIndex && previousIndex >= 0) out[previousIndex] += `\n>\n${quoted}`;
+      else out.push(quoted);
+      ctx.lastQuote = out.length - 1;
     } else if (tag === 'hr') {
       out.push('---');
     } else if (tag === 'img' || tag === 'figure' || tag === 'script' || tag === 'style') {
       // Las imágenes no aportan texto: se omiten.
     } else {
-      walkBlocks(node, out);
+      walkBlocks(node, out, ctx);
     }
   });
 }
 
 export function htmlToMarkdown(root) {
   const out = [];
-  walkBlocks(root, out);
+  const hasTitle = Boolean(root.querySelector && root.querySelector('.doc-title'));
+  walkBlocks(root, out, { shift: hasTitle ? 1 : 0 });
   return out.filter(Boolean).join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 /* ---------- PDF (posiciones de texto -> Markdown) ---------- */
 
-export function toPdfItems(textContent) {
+/* fonts (opcional): { [fontName]: nombre real de la tipografía } para detectar negrita, cursiva y monoespaciada. */
+export function toPdfItems(textContent, fonts = {}) {
+  const styles = textContent.styles || {};
+  const flags = new Map();
+  const flagsFor = (fontName) => {
+    if (!flags.has(fontName)) {
+      const real = String(fonts[fontName] || '').replace(/^[A-Z]{6}\+/, '');
+      flags.set(fontName, {
+        bold: /bold|black|heavy|semibold|demi/i.test(real),
+        italic: /italic|oblique/i.test(real),
+        mono: styles[fontName]?.fontFamily === 'monospace' || /mono|courier|consolas|menlo|typewriter/i.test(real),
+      });
+    }
+    return flags.get(fontName);
+  };
   return textContent.items
     .filter((item) => typeof item.str === 'string')
     .map((item) => ({
@@ -324,59 +486,8 @@ export function toPdfItems(textContent) {
       y: item.transform[5],
       h: Math.abs(item.transform[3]) || item.height || 10,
       w: item.width || 0,
+      ...flagsFor(item.fontName),
     }));
-}
-
-function buildLines(items) {
-  const sorted = items.filter((i) => i.str !== '').sort((a, b) => b.y - a.y);
-  const clusters = [];
-  for (const item of sorted) {
-    const current = clusters[clusters.length - 1];
-    if (current && Math.abs(current.y - item.y) <= Math.max(2, Math.min(current.h, item.h) * 0.45)) current.items.push(item);
-    else clusters.push({ y: item.y, h: item.h, items: [item] });
-  }
-
-  return clusters
-    .map((cluster) => {
-      cluster.items.sort((a, b) => a.x - b.x);
-      let text = '';
-      let prevEnd = null;
-      let tallest = cluster.items[0];
-      for (const item of cluster.items) {
-        if (item.str.trim().length > tallest.str.trim().length) tallest = item;
-        const gap = prevEnd === null ? 0 : item.x - prevEnd;
-        if (prevEnd !== null && gap > item.h * 0.18 && !/\s$/.test(text) && !/^\s/.test(item.str)) text += ' ';
-        text += item.str;
-        prevEnd = item.x + item.w;
-      }
-      return { text: text.replace(/\s+/g, ' ').trim(), y: cluster.y, h: tallest.h, x: cluster.items[0].x };
-    })
-    .filter((line) => line.text);
-}
-
-function median(values) {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-}
-
-function dropRepeatedHeadersAndFooters(pages) {
-  const key = (line) => line.text.toLowerCase().replace(/\d+/g, '#');
-  const edge = (lines) => [...lines.slice(0, 2), ...lines.slice(-2)];
-  const counts = new Map();
-  pages.forEach((lines) => {
-    new Set(edge(lines).map(key)).forEach((k) => counts.set(k, (counts.get(k) || 0) + 1));
-  });
-  const minPages = Math.max(2, Math.ceil(pages.length * 0.5));
-
-  return pages.map((lines) => {
-    const edges = new Set(edge(lines));
-    return lines.filter((line) => {
-      if (!edges.has(line)) return true;
-      if (PAGE_NUMBER.test(line.text)) return false;
-      return !(pages.length >= 2 && counts.get(key(line)) >= minPages);
-    });
-  });
 }
 
 /* Subíndices y superíndices: pdf.js los entrega como textos aparte, más pequeños y desplazados.
@@ -752,118 +863,13 @@ function slidesToMarkdown(pages) {
 export function pdfPagesToMarkdown(input) {
   const pages = input.map((p) => (Array.isArray(p) ? { items: p } : p));
   if (isSlideDeck(pages)) return slidesToMarkdown(pages);
-  return documentToMarkdown(pages.map((p) => mergeScripts(p.items)));
-}
-
-function documentToMarkdown(pagesItems) {
-  const pages = dropRepeatedHeadersAndFooters(pagesItems.map(buildLines).filter((p) => p.length));
-  const all = pages.flat();
-  if (!all.length) return '';
-
-  // Tamaño de letra del cuerpo: el que más caracteres acumula.
-  const weight = new Map();
-  all.forEach((l) => weight.set(Math.round(l.h * 2) / 2, (weight.get(Math.round(l.h * 2) / 2) || 0) + l.text.length));
-  const bodyH = [...weight.entries()].sort((a, b) => b[1] - a[1])[0][0];
-
-  // Interlineado típico, para distinguir un salto de párrafo de un simple salto de línea.
-  const gaps = [];
-  pages.forEach((lines) => {
-    for (let i = 1; i < lines.length; i += 1) {
-      const gap = lines[i - 1].y - lines[i].y;
-      if (Math.abs(lines[i].h - bodyH) < 0.6 && gap >= bodyH * 0.9 && gap <= bodyH * 2.4) gaps.push(gap);
-    }
-  });
-  const leading = median(gaps) || bodyH * 1.3;
-
-  // Marca cada línea: ¿empieza un bloque nuevo?
-  const flat = [];
-  pages.forEach((lines, p) => {
-    lines.forEach((line, i) => {
-      const previous = i === 0 ? null : lines[i - 1];
-      flat.push({ ...line, page: p, breakBefore: previous ? previous.y - line.y > leading * 1.45 : true, firstOnPage: i === 0 });
-    });
-  });
-
-  const blocks = [];
-  let para = null;
-  const pushPara = () => {
-    if (para) blocks.push(para);
-    para = null;
-  };
-
-  flat.forEach((line, i) => {
-    const ratio = line.h / bodyH;
-    const next = flat[i + 1];
-    const standalone = line.breakBefore && (!next || next.breakBefore);
-    const numbered = line.text.match(NUMBERED_HEADING);
-
-    let level = 0;
-    if (ratio >= 1.18 && line.text.length <= 110 && !/[.;,]$/.test(line.text)) level = ratio >= 1.7 ? 1 : ratio >= 1.35 ? 2 : 3;
-    else if (numbered && standalone && line.text.length <= 80 && !SENTENCE_END.test(line.text)) level = Math.min(numbered[1].split('.').length + 1, 5);
-
-    if (level) {
-      const previous = blocks[blocks.length - 1];
-      if (para === null && previous && previous.type === 'heading' && previous.level === level && !line.breakBefore) {
-        previous.text += ` ${line.text}`;
-      } else {
-        pushPara();
-        blocks.push({ type: 'heading', level, text: line.text });
-      }
-      return;
-    }
-
-    const isItem = BULLET.test(line.text) || NUMBERED.test(line.text);
-    if (isItem) {
-      pushPara();
-      const bullet = BULLET.test(line.text);
-      blocks.push({
-        type: 'item',
-        text: bullet ? `- ${line.text.replace(BULLET, '')}` : `${line.text.match(NUMBERED)[1]}. ${line.text.replace(NUMBERED, '')}`,
-      });
-      return;
-    }
-
-    const previousBlock = blocks[blocks.length - 1];
-    let continuesBlock = !line.breakBefore;
-    if (line.firstOnPage && line.page > 0 && previousBlock && !para) {
-      continuesBlock = previousBlock.type === 'item' ? !SENTENCE_END.test(previousBlock.text) : false;
-    } else if (line.firstOnPage && line.page > 0 && para) {
-      continuesBlock = !/[.!?:;»”"')\]]$/.test(para.lines[para.lines.length - 1]);
-    }
-
-    if (continuesBlock && para) {
-      para.lines.push(line.text);
-    } else if (continuesBlock && previousBlock && previousBlock.type === 'item') {
-      previousBlock.text += ` ${line.text}`;
-    } else {
-      pushPara();
-      para = { type: 'p', lines: [line.text] };
-    }
-  });
-  pushPara();
-
-  const out = [];
-  blocks.forEach((block, i) => {
-    if (block.type === 'heading') out.push(`${'#'.repeat(block.level)} ${block.text}`);
-    else if (block.type === 'item') {
-      if (blocks[i - 1] && blocks[i - 1].type === 'item') out[out.length - 1] += `\n${block.text}`;
-      else out.push(block.text);
-    } else {
-      let text = block.lines[0];
-      for (let k = 1; k < block.lines.length; k += 1) {
-        const nextLine = block.lines[k];
-        text = /[A-Za-zÀ-ÿ]-$/.test(text) && /^[a-zà-ÿ]/.test(nextLine) ? text.slice(0, -1) + nextLine : `${text} ${nextLine}`;
-      }
-      out.push(text);
-    }
-  });
-  return out.join('\n\n').trim();
+  return documentToMarkdown(pages.map((p) => ({ ...p, items: mergeScripts(p.items) })));
 }
 
 /* Respaldo para una sola página cuando la IA falla: usa la lectura local.
    Con asSlide se conserva el formato "## Diapositiva N"; si no, se devuelve el texto de la página. */
 export function fallbackPageToMarkdown(page, number, asSlide = true) {
   if (asSlide) return slideToMarkdown(page, number);
-  const text = documentToMarkdown([mergeScripts(page.items || [])]);
+  const text = documentToMarkdown([{ ...page, items: mergeScripts(page.items || []) }]);
   return `## Página ${number}\n\n${text || '*[Página sin texto legible.]*'}`;
 }

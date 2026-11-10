@@ -1,0 +1,21 @@
+/* Estilos de Word que mammoth no conoce (en inglés y en español) y que sí tienen equivalente en Markdown. */
+export const DOCX_STYLE_MAP = [
+  "p[style-name='Title'] => h1.doc-title:fresh",
+  "p[style-name='Título'] => h1.doc-title:fresh",
+  "p[style-name='Subtitle'] => p.doc-subtitle:fresh",
+  "p[style-name='Subtítulo'] => p.doc-subtitle:fresh",
+  "p[style-name='Quote'] => blockquote:fresh",
+  "p[style-name='Intense Quote'] => blockquote:fresh",
+  "p[style-name='Block Text'] => blockquote:fresh",
+  "p[style-name='Cita'] => blockquote:fresh",
+  "p[style-name='Cita destacada'] => blockquote:fresh",
+  "p[style-name='Source Code'] => pre:fresh",
+  "p[style-name='Code'] => pre:fresh",
+  "p[style-name='Código'] => pre:fresh",
+  "p[style-name='HTML Preformatted'] => pre:fresh",
+  "p[style-name='Preformatted Text'] => pre:fresh",
+  "r[style-name='Verbatim Char'] => code",
+  "r[style-name='Source Code Char'] => code",
+  "r[style-name='HTML Code'] => code",
+  "r[style-name='Código HTML'] => code",
+];

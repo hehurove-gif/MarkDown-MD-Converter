@@ -2,6 +2,7 @@
 import Tesseract from 'tesseract.js';
 import mammoth from 'mammoth';
 import * as pdfjsLib from 'pdfjs-dist';
+import { DOCX_STYLE_MAP } from './docxStyles.js';
 import { fallbackPageToMarkdown, htmlToMarkdown, isSlideDeck, pdfPagesToMarkdown, plainTextToMarkdown, toPdfItems } from './convert.js';
 import { MAX_VISION_PAGES, VISION_MAX_SIDE, transcribePages } from './vision.js';
 
@@ -13,6 +14,8 @@ const OCR_MAX_PAGES = 30;
 const OCR_MIN_CHARS = 40;
 const OCR_LOAD_TIMEOUT_MS = 120000;
 const EMPTY_MESSAGE = 'No se encontró texto en el archivo.';
+
+
 
 export const supportedExtensions = ['.txt', '.docx', '.pdf', '.png', '.jpg', '.jpeg'];
 
@@ -58,7 +61,7 @@ async function readDocx(file) {
   const result = await mammoth.convertToHtml(
     { arrayBuffer },
     {
-      styleMap: ["p[style-name='Title'] => h1:fresh", "p[style-name='Subtitle'] => h2:fresh"],
+      styleMap: DOCX_STYLE_MAP,
       // Las imágenes no aportan texto y harían el resultado enorme.
       convertImage: mammoth.images.imgElement(() => Promise.resolve({ src: '' })),
     },
@@ -178,11 +181,26 @@ async function ocrPdf(pdf, onProgress) {
   return { markdown: plainTextToMarkdown(texts.join('\n\n')), note };
 }
 
-async function countImages(page) {
+const IMAGE_OPS = () => {
   const { OPS } = pdfjsLib;
-  const imageOps = new Set([OPS.paintImageXObject, OPS.paintInlineImageXObject, OPS.paintImageMaskXObject, OPS.paintJpegXObject].filter((op) => op !== undefined));
+  return new Set([OPS.paintImageXObject, OPS.paintInlineImageXObject, OPS.paintImageMaskXObject, OPS.paintJpegXObject].filter((op) => op !== undefined));
+};
+
+// Lista de operaciones de la página: sirve para contar imágenes y para que pdf.js cargue las tipografías reales
+// (así se puede saber qué texto está en negrita, cursiva o monoespaciado).
+async function pageFontsAndImages(page, content) {
   const list = await page.getOperatorList();
-  return list.fnArray.filter((fn) => imageOps.has(fn)).length;
+  const imageOps = IMAGE_OPS();
+  const imageCount = list.fnArray.filter((fn) => imageOps.has(fn)).length;
+  const fonts = {};
+  new Set(content.items.map((item) => item.fontName)).forEach((id) => {
+    try {
+      if (id && page.commonObjs.has(id)) fonts[id] = page.commonObjs.get(id)?.name;
+    } catch {
+      // Sin datos de la tipografía: se queda sin negrita/cursiva.
+    }
+  });
+  return { imageCount, fonts };
 }
 
 // En muchas presentaciones hay diapositivas que son una sola imagen (texto incluido): sin OCR se perderían.
@@ -226,11 +244,17 @@ async function readPdf(file, onProgress, options = {}) {
   for (let n = 1; n <= pdf.numPages; n += 1) {
     const page = await pdf.getPage(n);
     const { width, height } = page.getViewport({ scale: 1 });
-    const items = toPdfItems(await page.getTextContent());
+    const content = await page.getTextContent();
+    let details = { imageCount: 0, fonts: {} };
+    try {
+      details = await pageFontsAndImages(page, content);
+    } catch (error) {
+      console.error(error);
+    }
+    const items = toPdfItems(content, details.fonts);
     const chars = items.reduce((sum, item) => sum + item.str.trim().length, 0);
     characters += chars;
-    const imageCount = chars < OCR_MIN_CHARS ? await countImages(page) : 0;
-    pages.push({ number: n, items, chars, width, height, imageCount });
+    pages.push({ number: n, items, chars, width, height, imageCount: chars < OCR_MIN_CHARS ? details.imageCount : 0 });
   }
 
   if (options.ai) {
