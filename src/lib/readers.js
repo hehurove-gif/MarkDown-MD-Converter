@@ -2,7 +2,8 @@
 import Tesseract from 'tesseract.js';
 import mammoth from 'mammoth';
 import * as pdfjsLib from 'pdfjs-dist';
-import { htmlToMarkdown, isSlideDeck, pdfPagesToMarkdown, plainTextToMarkdown, toPdfItems } from './convert.js';
+import { fallbackPageToMarkdown, htmlToMarkdown, isSlideDeck, pdfPagesToMarkdown, plainTextToMarkdown, toPdfItems } from './convert.js';
+import { MAX_VISION_PAGES, VISION_MAX_SIDE, transcribePages } from './vision.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
@@ -81,6 +82,84 @@ async function renderPage(page) {
   return canvas;
 }
 
+function canvasToJpegBase64(canvas) {
+  return canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+}
+
+// Página de PDF -> JPEG con el lado mayor de hasta VISION_MAX_SIDE px (el máximo útil para la IA).
+async function pageToJpeg(page) {
+  const base = page.getViewport({ scale: 1 });
+  const scale = Math.min(3, VISION_MAX_SIDE / Math.max(base.width, base.height));
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(viewport.width);
+  canvas.height = Math.round(viewport.height);
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#fff';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: context, viewport }).promise;
+  return canvasToJpegBase64(canvas);
+}
+
+async function imageFileToJpeg(file) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, VISION_MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#fff';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+  return canvasToJpegBase64(canvas);
+}
+
+async function readPdfWithAi(pdf, pages, options, onProgress) {
+  const { ai, signal } = options;
+  if (pdf.numPages > MAX_VISION_PAGES) {
+    throw new Error(`La lectura con IA admite hasta ${MAX_VISION_PAGES} páginas y este PDF tiene ${pdf.numPages}. Divídelo en partes o desactiva la lectura con IA.`);
+  }
+
+  const slides = isSlideDeck(pages);
+  const label = slides ? 'Diapositiva' : 'Página';
+  onProgress?.(`Leyendo con IA: 0 de ${pdf.numPages}…`);
+
+  const results = await transcribePages({
+    pages: pages.map((p) => ({
+      number: p.number,
+      hint: p.items.map((i) => i.str).join(' '),
+      getImage: async () => pageToJpeg(await pdf.getPage(p.number)),
+    })),
+    apiKey: ai.apiKey,
+    model: ai.model,
+    label,
+    total: pdf.numPages,
+    signal,
+    onProgress: (done, total) => onProgress?.(`Leyendo con IA: ${done} de ${total}…`),
+  });
+
+  let failed = 0;
+  let empty = 0;
+  const out = results.map((result, i) => {
+    if (result.markdown) return result.markdown;
+    if (result.error) {
+      failed += 1;
+      return `${fallbackPageToMarkdown(pages[i], result.number, slides)}
+
+*[La IA no pudo leer esta página (${result.error}); se usó la lectura local.]*`;
+    }
+    empty += 1;
+    return '';
+  });
+
+  const markdown = out.filter(Boolean).join('\n\n').trim();
+  const notes = [`Leído con IA (${ai.model}): puede contener errores, revísalo antes de usarlo.`];
+  if (failed) notes.push(`${failed} páginas fallaron y se leyeron con el método local.`);
+  if (empty) notes.push(`${empty} páginas sin contenido informativo se omitieron.`);
+  return { markdown, note: notes.join(' ') };
+}
+
 async function ocrPdf(pdf, onProgress) {
   const total = Math.min(pdf.numPages, OCR_MAX_PAGES);
   const worker = await createOcrWorker(onProgress);
@@ -138,7 +217,7 @@ async function ocrImageOnlyPages(pdf, pages, onProgress) {
   return `${done} diapositivas eran solo imagen y se leyeron con OCR (pueden tener errores).`;
 }
 
-async function readPdf(file, onProgress) {
+async function readPdf(file, onProgress, options = {}) {
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await pdfjsLib.getDocument({ data }).promise;
   const pages = [];
@@ -154,6 +233,12 @@ async function readPdf(file, onProgress) {
     pages.push({ number: n, items, chars, width, height, imageCount });
   }
 
+  if (options.ai?.apiKey) {
+    const result = await readPdfWithAi(pdf, pages, options, onProgress);
+    if (!result.markdown) throw new Error(EMPTY_MESSAGE);
+    return result;
+  }
+
   // Sin texto seleccionable: es un PDF escaneado, se lee con OCR.
   if (characters / pdf.numPages < 15) {
     const scanned = await ocrPdf(pdf, onProgress);
@@ -167,7 +252,21 @@ async function readPdf(file, onProgress) {
   return { markdown, note };
 }
 
-async function readImage(file, onProgress) {
+async function readImage(file, onProgress, options = {}) {
+  if (options.ai?.apiKey) {
+    onProgress?.('Leyendo la imagen con IA…');
+    const [result] = await transcribePages({
+      pages: [{ number: 1, hint: '', getImage: () => imageFileToJpeg(file) }],
+      apiKey: options.ai.apiKey,
+      model: options.ai.model,
+      label: '',
+      total: 1,
+      signal: options.signal,
+    });
+    if (result.error) throw new Error(result.error);
+    if (!result.markdown) throw new Error(EMPTY_MESSAGE);
+    return { markdown: result.markdown, note: `Leído con IA (${options.ai.model}): puede contener errores, revísalo antes de usarlo.` };
+  }
   const worker = await createOcrWorker(onProgress);
   try {
     const { data } = await worker.recognize(file);

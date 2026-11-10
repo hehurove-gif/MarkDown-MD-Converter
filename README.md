@@ -65,3 +65,12 @@ Probar en local: `VITE_BASE_PATH=/tools/markdown/ npm run build`.
 - El OCR (imágenes y PDFs escaneados) descarga el motor y el idioma la primera vez (~20 MB), así que necesita internet esa vez. Los PDF escaneados se leen hasta 30 páginas.
 - Tu archivo se procesa en tu navegador y no se sube a ningún servidor.
 - Los `.doc` antiguos no se pueden leer en el navegador: ábrelo en Word y guárdalo como `.docx`.
+
+## Lectura con IA (opcional)
+
+Para PDFs e imágenes con esquemas, reacciones químicas o tablas dibujadas, activa **Lectura con IA** en el panel izquierdo:
+
+- Pegas tu propia clave de API de Anthropic y eliges el modelo. La clave va directo del navegador a `api.anthropic.com`; no pasa por ningún servidor de este proyecto y solo se guarda en el navegador si marcas "Recordar".
+- Cada página se envía como imagen (JPEG, máx. 1568 px) y tiene costo en tu cuenta de Anthropic. Límite: 80 páginas por archivo.
+- Si una página falla, se usa la lectura local para esa página. Sin clave, todo sigue procesándose localmente.
+- Pruebas: `npm test`.

@@ -859,3 +859,11 @@ function documentToMarkdown(pagesItems) {
   });
   return out.join('\n\n').trim();
 }
+
+/* Respaldo para una sola página cuando la IA falla: usa la lectura local.
+   Con asSlide se conserva el formato "## Diapositiva N"; si no, se devuelve el texto de la página. */
+export function fallbackPageToMarkdown(page, number, asSlide = true) {
+  if (asSlide) return slideToMarkdown(page, number);
+  const text = documentToMarkdown([mergeScripts(page.items || [])]);
+  return `## Página ${number}\n\n${text || '*[Página sin texto legible.]*'}`;
+}

@@ -1,9 +1,12 @@
 import React, { useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { detectReader, supportedExtensions } from './lib/readers.js';
+import { loadAiSettings, saveAiSettings } from './lib/aiSettings.js';
+import { VISION_MODELS } from './lib/vision.js';
 import './index.css';
 
 const acceptedExtensions = [...supportedExtensions, '.doc'];
+const aiExtensions = ['.pdf', '.png', '.jpg', '.jpeg'];
 
 function App() {
   const inputRef = useRef(null);
@@ -12,6 +15,18 @@ function App() {
   const [status, setStatus] = useState('Listo para convertir.');
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [ai, setAi] = useState(loadAiSettings);
+  const [usedAi, setUsedAi] = useState(false);
+  const abortRef = useRef(null);
+
+  const updateAi = (changes) => {
+    const next = { ...ai, ...changes };
+    setAi(next);
+    saveAiSettings(next);
+  };
+
+  const supportsAi = selectedFile ? aiExtensions.some((ext) => selectedFile.name.toLowerCase().endsWith(ext)) : false;
+  const aiActive = ai.enabled && ai.apiKey.trim().length > 0;
 
   const fileLabel = useMemo(() => {
     if (!selectedFile) return 'Sin archivo seleccionado';
@@ -37,18 +52,33 @@ function App() {
       return;
     }
 
+    if (ai.enabled && !ai.apiKey.trim()) {
+      setStatus('Pega tu clave de API para usar la lectura con IA, o desactívala.');
+      return;
+    }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const useAi = aiActive && supportsAi;
     setIsProcessing(true);
     setStatus('Procesando documento...');
 
     try {
       const reader = detectReader(selectedFile.name);
-      const result = await reader(selectedFile, (message) => setStatus(message));
+      const options = { signal: controller.signal, ai: useAi ? { apiKey: ai.apiKey.trim(), model: ai.model } : null };
+      const result = await reader(selectedFile, (message) => setStatus(message), options);
+      setUsedAi(useAi);
       setMarkdown(result.markdown);
       setStatus(result.note ? `Listo. ${result.note}` : '¡Conversión exitosa y lista para IA!');
     } catch (error) {
-      console.error(error);
-      setStatus(error.message || 'No se pudo procesar el archivo.');
+      if (error?.name === 'AbortError') {
+        setStatus('Conversión cancelada.');
+      } else {
+        console.error(error);
+        setStatus(error.message || 'No se pudo procesar el archivo.');
+      }
     } finally {
+      abortRef.current = null;
       setIsProcessing(false);
     }
   };
@@ -152,6 +182,76 @@ function App() {
               >
                 {isProcessing ? 'Procesando...' : 'Convertir'}
               </button>
+              {isProcessing && (
+                <button
+                  type="button"
+                  onClick={() => abortRef.current?.abort()}
+                  className="rounded-xl border border-slate-600 px-3 py-2.5 text-sm font-medium text-slate-200 transition hover:border-rose-400 hover:text-rose-300"
+                >
+                  Cancelar
+                </button>
+              )}
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-3">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={ai.enabled}
+                  onChange={(event) => updateAi({ enabled: event.target.checked })}
+                  className="mt-1 h-4 w-4 accent-cyan-400"
+                />
+                <span>
+                  <span className="block text-sm font-semibold text-white">Lectura con IA (más precisa)</span>
+                  <span className="block text-xs text-slate-400">
+                    Transcribe esquemas, reacciones y tablas de PDFs e imágenes. Cada página se envía a Anthropic con tu propia clave de API y tiene costo.
+                  </span>
+                </span>
+              </label>
+
+              {ai.enabled && (
+                <div className="mt-3 space-y-3 text-sm">
+                  <label className="block">
+                    <span className="mb-1 block text-xs text-slate-400">Clave de API de Anthropic</span>
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={ai.apiKey}
+                      onChange={(event) => updateAi({ apiKey: event.target.value.trim() })}
+                      placeholder="sk-ant-..."
+                      className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 block text-xs text-slate-400">Modelo</span>
+                    <select
+                      value={ai.model}
+                      onChange={(event) => updateAi({ model: event.target.value })}
+                      className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-slate-100 outline-none focus:border-cyan-400"
+                    >
+                      {VISION_MODELS.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={ai.remember}
+                      onChange={(event) => updateAi({ remember: event.target.checked })}
+                      className="h-4 w-4 accent-cyan-400"
+                    />
+                    Recordar la clave en este navegador (no uses esto en una computadora compartida)
+                  </label>
+                  <p className="text-xs text-slate-500">
+                    La clave no se guarda en ningún servidor nuestro: va directo del navegador a Anthropic. Solo aplica a PDF, PNG y JPG.
+                    {selectedFile && !supportsAi ? ' Este archivo se convertirá sin IA.' : ''}
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950/40 px-3 py-2 text-sm text-slate-300">
@@ -197,7 +297,9 @@ function App() {
             {markdown && (
               <p className="mt-3 text-xs text-slate-400">
                 {markdown.length.toLocaleString('es-MX')} caracteres · aprox. {Math.ceil(markdown.length / 4).toLocaleString('es-MX')} tokens
-                · tu archivo se procesa en tu navegador y no se sube a ningún servidor.
+                {usedAi
+                  ? '· las páginas se enviaron a Anthropic para leerlas con IA.'
+                  : '· tu archivo se procesa en tu navegador y no se sube a ningún servidor.'}
               </p>
             )}
           </section>
